@@ -54,3 +54,20 @@ def test_single_portfolio_holds_exactly_one_stock(ledgers: dict[str, Ledger]) ->
         assert len(engine.snapshot(day).holdings) == 1
         assert abs(concentration.hhi - 1.0) < 1e-9
         assert abs(concentration.n_eff - 1.0) < 1e-9
+
+
+def test_fixture_sectors_use_the_project_taxonomy() -> None:
+    """픽스처의 섹터는 적재기가 실제로 만들어내는 어휘와 같아야 한다.
+
+    ingest/ksic_sectors.json 이 유일한 출처다. 픽스처가 자기만의 이름을 쓰면
+    테스트는 통과하지만 Risk Engine이 실데이터에서 다른 어휘를 보게 된다.
+    """
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    known = set(json.loads((root / "ingest" / "ksic_sectors.json").read_text(encoding="utf-8"))["sectors"])
+    fixture = json.loads((root / "tests" / "fixtures" / "seed_portfolio.json").read_text(encoding="utf-8"))
+    used = {v["sector"] for v in fixture["instruments"].values()}
+
+    assert used <= known, f"표준 섹터에 없는 값: {sorted(used - known)}"
