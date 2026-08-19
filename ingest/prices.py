@@ -58,6 +58,11 @@ def _fetch_ohlcv(ticker: str, start: date, end: date) -> pd.DataFrame:
     )
 
 
+def _opt_int(value: object) -> int | None:
+    """결측을 None으로. 루프 안에서 클로저로 만들면 늦은 바인딩 문제가 생긴다."""
+    return None if value is None or pd.isna(value) else int(value)
+
+
 def _to_rows(ticker: str, df: pd.DataFrame) -> list[dict]:
     """DataFrame을 upsert 행으로 변환한다.
 
@@ -76,19 +81,15 @@ def _to_rows(ticker: str, df: pd.DataFrame) -> list[dict]:
             continue
         trade_date = idx.date() if isinstance(idx, (pd.Timestamp, datetime)) else idx
 
-        def _int(key: str) -> int | None:
-            v = r.get(key)
-            return None if v is None or pd.isna(v) else int(v)
-
         rows.append(
             {
                 "ticker": ticker,
                 "trade_date": trade_date,
-                "open": _int("open"),
-                "high": _int("high"),
-                "low": _int("low"),
+                "open": _opt_int(r.get("open")),
+                "high": _opt_int(r.get("high")),
+                "low": _opt_int(r.get("low")),
                 "close": int(close),
-                "volume": _int("volume"),
+                "volume": _opt_int(r.get("volume")),
                 # pykrx의 이 호출은 거래대금을 주지 않는다. 필요해지면 별도 조회를 붙인다.
                 "trade_value": None,
             }
