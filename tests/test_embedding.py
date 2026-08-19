@@ -106,14 +106,33 @@ def test_failed_batch_leaves_none_and_keeps_the_rest() -> None:
     assert [v is None for v in out] == [False, False, True, True, False, False]
 
 
-def test_dimension_mismatch_is_rejected() -> None:
-    """차원이 다르면 INSERT에서 실패한다. 그 전에 잡는다."""
+def test_short_vector_is_rejected() -> None:
+    """짧게 오면 늘릴 방법이 없다. INSERT까지 가기 전에 잡는다."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}]})
 
     e = OpenAIEmbedder("k", dim=DIM, client=_client(handler))
     assert e.embed(["a"]) == [None]
+
+
+def test_long_vector_is_truncated_and_renormalized() -> None:
+    """게이트웨이가 dimensions를 통과시키지 않으면 기본 1536이 돌아온다.
+
+    text-embedding-3은 Matryoshka 학습이라 뒤를 잘라내고 L2 정규화하면 된다.
+    OpenAI가 문서화한 축소 방법이라 검색 품질 손실이 작다.
+    """
+    import math
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": [{"index": 0, "embedding": [3.0] * (DIM * 4)}]}
+        )
+
+    out = OpenAIEmbedder("k", dim=DIM, client=_client(handler)).embed(["a"])
+    assert out[0] is not None
+    assert len(out[0]) == DIM
+    assert math.isclose(math.sqrt(sum(x * x for x in out[0])), 1.0, abs_tol=1e-9)
 
 
 def test_count_mismatch_is_rejected() -> None:

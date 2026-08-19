@@ -9,6 +9,7 @@ text-embedding-3 계열은 `dimensions`로 축소를 지원한다(Matryoshka). �
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 
@@ -76,6 +77,7 @@ class OpenAIEmbedder(Embedder):
         self._url = (base_url or settings.openai_base_url or OPENAI_DEFAULT_BASE_URL).rstrip("/")
         self._key = api_key
         self._client = client
+        self._warned_truncate = False
 
     def _post(self, batch: list[str]) -> list[list[float]]:
         payload = {"model": self.model, "input": batch, "dimensions": self.dim}
@@ -94,10 +96,36 @@ class OpenAIEmbedder(Embedder):
         vectors = [r["embedding"] for r in rows]
         if len(vectors) != len(batch):
             raise ValueError(f"응답 개수 불일치: 요청 {len(batch)} 응답 {len(vectors)}")
-        for v in vectors:
-            if len(v) != self.dim:
-                raise ValueError(f"차원 불일치: 기대 {self.dim} 실제 {len(v)}")
-        return vectors
+        return [self._fit(v) for v in vectors]
+
+    def _fit(self, vec: list[float]) -> list[float]:
+        """차원을 맞춘다.
+
+        게이트웨이가 dimensions를 통과시키지 않으면 기본 1536이 돌아온다.
+        text-embedding-3 계열은 Matryoshka 학습이라 뒤를 잘라내고 L2 정규화하면
+        되는데, 이는 OpenAI가 문서화한 축소 방법이다. 서버가 줄여준 것과
+        완전히 같지는 않지만 검색 품질 손실은 작다.
+
+        반대로 짧게 오면 자를 수 없으므로 거부한다.
+        """
+        n = len(vec)
+        if n == self.dim:
+            return vec
+        if n < self.dim:
+            raise ValueError(f"차원 부족: 기대 {self.dim} 실제 {n}")
+
+        if not self._warned_truncate:
+            log.warning(
+                "응답 차원이 %d다. dimensions가 전달되지 않은 것으로 보여 "
+                "%d로 잘라 정규화한다.", n, self.dim
+            )
+            self._warned_truncate = True
+
+        head = vec[: self.dim]
+        norm = math.sqrt(sum(x * x for x in head))
+        if norm == 0:
+            raise ValueError("잘라낸 벡터의 노름이 0이다")
+        return [x / norm for x in head]
 
     def embed(self, texts: Sequence[str]) -> list[list[float] | None]:
         """배치 단위로 호출한다. 한 배치가 실패해도 나머지는 살린다.
