@@ -24,8 +24,14 @@ twins, they are half CSS. Read the section you were pointed at, once. For
 anything broader than a single file, delegate to an Explore subagent so the
 file dumps land in its context, not yours.
 
-**Do not re-derive what you already committed.** After a compaction, check
-`git log` and `git status` before re-reading files.
+**Keep a progress note.** Append one line to `.worker/progress.md` after every
+commit and every decision you would not want to make twice — what is done,
+what is next, which paths matter. Two sentences, not a report.
+
+**After a compaction, read that note first.** Then `git log` and `git status`.
+Re-read a source file only if the note and the diff cannot answer your
+question. Workers have burned entire sessions re-reading the same four files
+after every compaction; the note exists to make that unnecessary.
 
 ## Definition of done
 
