@@ -48,6 +48,7 @@ KST = timezone(timedelta(hours=9))
 REQUEST_DELAY_S = 0.15
 
 _TAGS = re.compile(r"<[^>]+>")
+_NOISE = re.compile(r"<(STYLE|SCRIPT)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
 
 class DartError(RuntimeError):
@@ -160,7 +161,7 @@ def extract_body(payload: bytes, rcept_no: str) -> str:
             raise DartError(f"zip 안에 원문이 없다: {names}")
         raw = archive.read(target)
 
-    text = _decode(raw)
+    text = _NOISE.sub(" ", _decode(raw))
     try:
         root = ElementTree.fromstring(text)
     except ElementTree.ParseError:
@@ -278,24 +279,24 @@ async def save(filing: Filing, body: str) -> int:
 # ── 실행 ───────────────────────────────────────────────────────
 
 
-async def run(days: int, limit: int, max_docs: int) -> tuple[int, int]:
-    """(적재 공시 수, 청크 수). 종목 단위로 실패를 격리한다."""
+async def run(days: int, limit: int, max_docs: int) -> tuple[int, int, int]:
+    """(적재 공시 수, 청크 수, 실패 종목 수). 종목 단위로 실패를 격리한다."""
     api_key = (settings.dart_api_key or "").strip()
     if not api_key:
         log.error("DART_API_KEY가 없다. .env를 확인하라")
-        return 0, 0
+        return 0, 0, 1
 
     targets = await load_targets(limit)
     if not targets:
         log.error("corp_code가 있는 종목이 없다. 먼저 `python -m ingest.instruments`를 돌려라")
-        return 0, 0
+        return 0, 0, 1
 
     today = date.today()
     bgn_de = (today - timedelta(days=days)).strftime("%Y%m%d")
     end_de = today.strftime("%Y%m%d")
     log.info("대상 %d종목 · 기간 %s~%s · 종목당 최대 %d건", len(targets), bgn_de, end_de, max_docs)
 
-    saved = chunks = 0
+    saved = chunks = failed = 0
     with httpx.Client() as client:
         for i, (ticker, corp_code) in enumerate(targets, start=1):
             try:
@@ -321,9 +322,10 @@ async def run(days: int, limit: int, max_docs: int) -> tuple[int, int]:
             except Exception:
                 # 한 종목이 죽어도 배치를 멈추지 않는다. 재실행하면 실패분만 다시 받는다.
                 log.exception("종목 적재 실패: ticker=%s", ticker)
+                failed += 1
 
-    log.info("공시 %d건 · 청크 %d개 적재", saved, chunks)
-    return saved, chunks
+    log.info("공시 %d건 · 청크 %d개 적재 · 실패 %d종목", saved, chunks, failed)
+    return saved, chunks, failed
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -338,8 +340,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
     )
-    saved, _ = asyncio.run(run(args.days, args.limit, args.max_docs))
-    return 0 if saved else 1
+    # httpx는 요청 URL을 통째로 찍는다. crtfc_key가 로그에 남으면 안 된다.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # 증분이라 신규가 0건인 재실행은 정상이다. 실패 종목이 있을 때만 비정상 종료해
+    # 재실행 대상이 남았음을 알린다.
+    _, _, failed = asyncio.run(run(args.days, args.limit, args.max_docs))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

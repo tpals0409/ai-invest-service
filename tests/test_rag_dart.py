@@ -95,6 +95,14 @@ def test_extract_body_falls_back_when_not_well_formed() -> None:
     assert "본문" in text and "<" not in text
 
 
+def test_extract_body_drops_style_block() -> None:
+    """DART 원문은 앞머리에 CSS를 달고 온다. 그대로 두면 첫 청크가 통째로 스타일시트가 된다."""
+    body = "<DOCUMENT><STYLE>.xforms * { font-family: 돋움체;}</STYLE><P>계약 체결</P></DOCUMENT>"
+    text = dart.extract_body(_zip_of(body.encode(), "20260814000342.xml"), "20260814000342")
+    assert "계약 체결" in text
+    assert "font-family" not in text
+
+
 def test_extract_body_decodes_cp949() -> None:
     payload = _zip_of("<P>구공시</P>".encode("cp949"), "20260814000342.xml")
     assert "구공시" in dart.extract_body(payload, "20260814000342")
