@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from app.core.enums import Market
 from ingest import instruments as ing
 
 CORP_CODE_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -192,48 +193,14 @@ class _FakeStock:
         return "전기전자"
 
 
-def test_collect_market_preserves_string_tickers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ing, "stock", _FakeStock())
-    rows = ing.collect_market("20260818", ing.Market.KOSPI)
-    assert [r.ticker for r in rows] == ["005930", "000660"]
-    assert all(isinstance(r.ticker, str) and len(r.ticker) == 6 for r in rows)
 
 
-def test_collect_market_maps_numeric_columns(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ing, "stock", _FakeStock())
-    samsung = ing.collect_market("20260818", ing.Market.KOSPI)[0]
-    assert samsung.name == "삼성전자"
-    assert samsung.market == "KOSPI"
-    assert samsung.market_cap == 309831714345000
-    assert samsung.listed_shares == 5969782550
-    assert samsung.status == "listed"
 
 
-def test_collect_market_survives_empty_sector_table(monkeypatch: pytest.MonkeyPatch) -> None:
-    """업종분류가 비어도 종목 자체는 적재돼야 한다."""
-    monkeypatch.setattr(ing, "stock", _FakeStock(sectors=SECTORS.iloc[:0]))
-    rows = ing.collect_market("20260818", ing.Market.KOSPI)
-    assert len(rows) == 2
-    assert all(r.sector is None for r in rows)
 
 
-def test_collect_instruments_fills_sector_code(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ing, "stock", _FakeStock())
-    rows = ing.collect_instruments("20260818")
-    assert {r.sector for r in rows} == {"전기전자"}
-    assert {r.sector_code for r in rows} == {"1012"}
 
 
-def test_collect_instruments_survives_index_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """업종 코드는 부가 정보다. 못 얻어도 나머지는 적재한다."""
-    fake = _FakeStock()
-    monkeypatch.setattr(ing, "stock", fake)
-    monkeypatch.setattr(
-        ing, "fetch_sector_index_codes", lambda _d: (_ for _ in ()).throw(KeyError("시장"))
-    )
-    rows = ing.collect_instruments("20260818")
-    assert len(rows) == 2
-    assert all(r.sector_code is None for r in rows)
 
 
 # ── upsert ───────────────────────────────────────────────
@@ -267,30 +234,112 @@ def test_upsert_batches_all_rows() -> None:
     assert "ON CONFLICT (ticker) DO UPDATE" in sql
 
 
-@pytest.mark.asyncio
 async def test_upsert_noop_on_empty_rows() -> None:
     assert await ing.upsert([]) == 0
 
 
 # ── 전체 흐름 ────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_run_skips_upsert_when_nothing_collected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ing, "collect_instruments", lambda _d: [])
-    monkeypatch.setattr(ing, "load_corp_codes", dict)
-    assert await ing.run("20260818") == 0
 
 
-@pytest.mark.asyncio
+
+
+# ── DART 기반 수집 ───────────────────────────────────────
+def _company(cls_: str, induty: str, name: str = "테스트전자") -> dict:
+    return {"status": "000", "corp_cls": cls_, "induty_code": induty,
+            "stock_name": name, "corp_name": name + "(주)"}
+
+
+def test_build_row_maps_market_from_corp_cls() -> None:
+    assert ing.build_row("005930", _company("Y", "264")).market == Market.KOSPI
+    assert ing.build_row("035720", _company("K", "63120")).market == Market.KOSDAQ
+
+
+def test_build_row_drops_delisted() -> None:
+    """corpCode.xml의 stock_code 보유 법인에는 폐지 종목이 섞여 있다.
+
+    corp_cls가 E(기타)나 N(코넥스)이면 현재 상장이 아니므로 넣지 않는다.
+    """
+    assert ing.build_row("036720", _company("E", "58221")) is None
+    assert ing.build_row("123456", _company("N", "26")) is None
+
+
+def test_build_row_keeps_raw_induty_code() -> None:
+    row = ing.build_row("000660", _company("Y", "2612"))
+    assert row.sector_code == "2612", "원본 KSIC를 남겨야 나중에 매핑을 바꿔도 재적재가 필요 없다"
+
+
+def test_semiconductor_cluster_groups_together() -> None:
+    """엔진 산식 §3.1의 섹터 집중도 진단이 성립하려면 이들이 한 섹터여야 한다.
+
+    KSIC 원본으로는 26/26/29로 흩어진다.
+    """
+    cases = {"005930": "264", "000660": "2612", "000990": "2611", "042700": "29271"}
+    sectors = {ing.build_row(t, _company("Y", c)).sector for t, c in cases.items()}
+    assert sectors == {"반도체"}
+
+
+def test_build_row_without_induty_code_falls_back() -> None:
+    row = ing.build_row("999999", _company("Y", ""))
+    assert row.sector == "기타"
+    assert row.sector_code is None
+
+
+def test_fetch_company_returns_none_on_rejected_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "013", "message": "조회된 데이타가 없습니다."})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert ing.fetch_company(client, "key", "00000000") is None
+
+
+def test_fetch_company_survives_non_json_response() -> None:
+    """DART가 오류 시 JSON이 아닌 문서를 돌려주기도 한다. 한 건 때문에 배치가 죽으면 안 된다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>error</html>")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        assert ing.fetch_company(client, "key", "00126380") is None
+
+
+def test_collect_instruments_skips_failures_and_keeps_going(monkeypatch) -> None:
+    monkeypatch.setattr(ing, "COMPANY_DELAY_S", 0)
+    payloads = {
+        "c1": _company("Y", "264", "가"),
+        "c2": None,                        # 조회 실패
+        "c3": _company("E", "58221", "다"),  # 폐지
+        "c4": _company("K", "63120", "라"),
+    }
+    monkeypatch.setattr(
+        ing, "fetch_company", lambda client, key, cc: payloads[cc]
+    )
+    mapping = {"000001": "c1", "000002": "c2", "000003": "c3", "000004": "c4"}
+    rows = ing.collect_instruments(None, "key", mapping)
+    assert [r.ticker for r in rows] == ["000001", "000004"]
+
+
+async def test_run_stops_when_corp_code_mapping_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DART 키가 없으면 종목 목록 자체를 얻을 수 없다. 빈 적재로 덮어쓰지 않는다."""
+    monkeypatch.setattr(ing, "load_corp_codes", lambda client: {})
+    assert await ing.run() == 0
+
+
 async def test_run_attaches_corp_codes_before_upsert(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[ing.InstrumentRow] = []
-    monkeypatch.setattr(ing, "stock", _FakeStock())
-    monkeypatch.setattr(ing, "load_corp_codes", lambda: {"005930": "00126380"})
+    monkeypatch.setattr(ing, "load_corp_codes", lambda client: {"005930": "00126380"})
+    monkeypatch.setattr(
+        ing,
+        "collect_instruments",
+        lambda client, key, mapping: [
+            ing.InstrumentRow(ticker="005930", name="삼성전자", market=Market.KOSPI),
+            ing.InstrumentRow(ticker="999999", name="미상", market=Market.KOSDAQ),
+        ],
+    )
 
     async def _capture(rows: list[ing.InstrumentRow]) -> int:
         captured.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(ing, "upsert", _capture)
-    assert await ing.run("20260818") == 2
+    assert await ing.run() == 2
     assert captured[0].corp_code == "00126380"
-    assert captured[1].corp_code is None
+    assert captured[1].corp_code is None, "매핑에 없는 종목은 고유번호를 붙이지 않는다"

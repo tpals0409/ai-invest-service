@@ -1,14 +1,15 @@
-"""종목 마스터 적재기.
+"""종목 마스터 적재.
 
-KOSPI · KOSDAQ 전 종목의 기본 정보를 pykrx로 모으고, DART corpCode.xml에서
-고유번호를 붙여 instruments 테이블에 upsert 한다.
+KOSPI · KOSDAQ 상장 종목의 기본 정보를 DART에서 모은다. corpCode.xml로 종목 목록과
+고유번호를 얻고, 기업개황으로 시장 구분과 업종을 채운다.
 
-이 적재기가 Phase 1의 최상단에 있는 이유는 corp_code 때문이다. DART 공시 조회는
-종목코드가 아니라 고유번호를 요구하므로, 공시 적재 트랙은 여기서 만들어진
-매핑 없이는 시작할 수 없다.
+KRX의 마스터 계열 엔드포인트(종목 목록·시가총액·업종분류)는 로그인 없이 빈 응답이나
+오류를 돌려준다. 시세(OHLCV)만 살아 있어 마스터는 DART로 조달한다.
 
-실행:
-    python -m ingest.instruments [--date YYYYMMDD]
+시가총액과 상장주식수는 DART가 주지 않으므로 비워 둔다. 엔진 산식 §3.5의
+대형/중소형 판정에서 쓰이는 Phase 2 항목이다.
+
+    python -m ingest.instruments
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import argparse
 import asyncio
 import io
 import logging
+import time
 import zipfile
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
@@ -24,7 +26,6 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 import httpx
-from pykrx import stock
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import Insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -33,6 +34,7 @@ from app.core.config import settings
 from app.core.db import SessionFactory
 from app.core.enums import InstrumentStatus, Market
 from app.core.models import Instrument
+from ingest.sectors import resolve
 
 log = logging.getLogger("ingest.instruments")
 
@@ -98,82 +100,91 @@ def _clean(value: object) -> str | None:
 
 
 # ── KRX 수집 ─────────────────────────────────────────────
-def fetch_sector_index_codes(date: str) -> dict[tuple[str, str], str]:
-    """(시장, 업종명) → KRX 업종지수 코드.
+DART_COMPANY_URL = "https://opendart.fss.or.kr/api/company.json"
 
-    KRX 업종분류(12025)는 업종명만 주고 코드를 주지 않는다. 업종지수 목록의
-    이름과 맞춰 코드를 얻는다. 이름 대조지만 양쪽 모두 KRX 자체 분류라
-    출처가 하나이므로, 법인명으로 corp_code를 붙이는 것과는 성격이 다르다.
+# 기업개황의 corp_cls. E(기타)와 N(코넥스)는 현재 상장이 아니다.
+# corpCode.xml의 stock_code 보유 법인 3,984개에는 폐지 종목이 섞여 있어
+# 이 값으로 걸러야 한다.
+CORP_CLS_TO_MARKET = {"Y": Market.KOSPI, "K": Market.KOSDAQ}
+
+# DART 일일 한도는 20,000회. 상장사 전체가 4천 건이라 한도는 넉넉하지만
+# 짧은 간격으로 몰아치면 거부당한다.
+COMPANY_DELAY_S = 0.12
+
+
+def build_row(ticker: str, payload: dict) -> InstrumentRow | None:
+    """기업개황 한 건을 행으로 만든다. 현재 상장이 아니면 None.
+
+    market_cap과 listed_shares는 DART가 주지 않으므로 비워 둔다.
+    엔진 산식 §3.5(대형/중소형 판정)에서 쓰이는 Phase 2 항목이다.
     """
-    codes: dict[tuple[str, str], str] = {}
-    for market in MARKETS:
-        for index_ticker in stock.get_index_ticker_list(date, market):
-            name = _clean(stock.get_index_ticker_name(index_ticker))
-            if name:
-                codes.setdefault((str(market), name), str(index_ticker))
-    return codes
+    market = CORP_CLS_TO_MARKET.get(_clean(payload.get("corp_cls")) or "")
+    if market is None:
+        return None
+
+    induty = _clean(payload.get("induty_code"))
+    sector, _ = resolve(induty, ticker)
+    name = _clean(payload.get("stock_name")) or _clean(payload.get("corp_name"))
+    if not name:
+        return None
+
+    return InstrumentRow(
+        ticker=ticker,
+        name=name,
+        market=market,
+        sector=sector,
+        sector_code=induty,
+    )
 
 
-def collect_market(date: str, market: Market) -> list[InstrumentRow]:
-    """한 시장의 종목을 모은다."""
-    caps = stock.get_market_cap_by_ticker(date, str(market))
-    if caps is None or caps.empty:
-        log.warning("[%s] 시가총액 조회가 비었다. 휴장일이거나 KRX 응답이 없다.", market)
-        return []
-
-    universe = {normalize_ticker(t) for t in stock.get_market_ticker_list(date, str(market)) or []}
-    sectors = stock.get_market_sector_classifications(date, str(market))
-    sector_of: dict[str, str | None] = {}
-    name_of: dict[str, str | None] = {}
-    if sectors is not None and not sectors.empty:
-        for raw_ticker, row in sectors.iterrows():
-            ticker = normalize_ticker(raw_ticker)
-            sector_of[ticker] = _clean(row.get("업종명"))
-            name_of[ticker] = _clean(row.get("종목명"))
-    else:
-        log.warning("[%s] 업종분류 조회가 비었다. sector 없이 진행한다.", market)
-
-    rows: list[InstrumentRow] = []
-    for raw_ticker, cap_row in caps.iterrows():
-        ticker = normalize_ticker(raw_ticker)
-        if universe and ticker not in universe:
-            continue  # ETF·ETN·리츠 등 보통주가 아닌 종목
-        name = name_of.get(ticker) or _clean(stock.get_market_ticker_name(ticker))
-        if not name:
-            log.warning("[%s] %s 종목명을 찾지 못해 건너뛴다.", market, ticker)
-            continue
-        rows.append(
-            InstrumentRow(
-                ticker=ticker,
-                name=name,
-                market=str(market),
-                sector=sector_of.get(ticker),
-                market_cap=_to_int(cap_row.get("시가총액")),
-                listed_shares=_to_int(cap_row.get("상장주식수")),
-            )
-        )
-    log.info("[%s] %d 종목 수집", market, len(rows))
-    return rows
-
-
-def collect_instruments(date: str) -> list[InstrumentRow]:
-    """전 시장 종목을 모으고 업종 코드까지 채운다."""
-    rows: list[InstrumentRow] = []
-    for market in MARKETS:
-        rows.extend(collect_market(date, market))
-
+def fetch_company(client: httpx.Client, api_key: str, corp_code: str) -> dict | None:
+    """기업개황 한 건. 실패하면 None을 돌려주고 그 종목만 건너뛴다."""
     try:
-        sector_codes = fetch_sector_index_codes(date)
-    except Exception as exc:  # noqa: BLE001 - 업종 코드는 부가 정보다
-        log.warning("업종지수 코드를 얻지 못했다. sector_code 없이 진행한다: %s", exc)
-        return rows
+        res = client.get(
+            DART_COMPANY_URL,
+            params={"crtfc_key": api_key, "corp_code": corp_code},
+            timeout=HTTP_TIMEOUT,
+        )
+        payload = res.json()
+    except (httpx.HTTPError, ValueError):
+        # 한 종목이 실패해도 4천 건짜리 배치를 멈추지 않는다.
+        # ValueError는 DART가 JSON 대신 오류 문서를 돌려줄 때 난다.
+        log.warning("기업개황 조회 실패: corp_code=%s", corp_code)
+        return None
 
-    matched = 0
-    for row in rows:
-        if row.sector:
-            row.sector_code = sector_codes.get((row.market, row.sector))
-            matched += row.sector_code is not None
-    log.info("업종 코드 %d/%d 매칭", matched, len(rows))
+    if payload.get("status") != "000":
+        log.debug(
+            "기업개황 응답 거절: corp_code=%s status=%s", corp_code, payload.get("status")
+        )
+        return None
+    return payload
+
+
+def collect_instruments(
+    client: httpx.Client, api_key: str, mapping: dict[str, str]
+) -> list[InstrumentRow]:
+    """corpCode 매핑을 돌며 기업개황으로 시장·업종을 채운다.
+
+    종목 목록 자체를 DART에서 얻는다. KRX의 마스터 계열 엔드포인트는 로그인 없이
+    빈 응답을 돌려주므로 시세(OHLCV) 외에는 기대할 수 없다.
+    """
+    rows: list[InstrumentRow] = []
+    skipped = 0
+    for i, (ticker, corp_code) in enumerate(sorted(mapping.items()), 1):
+        payload = fetch_company(client, api_key, corp_code)
+        if payload is None:
+            skipped += 1
+        else:
+            row = build_row(ticker, payload)
+            if row is None:
+                skipped += 1
+            else:
+                rows.append(row)
+        if i % 500 == 0:
+            log.info("기업개황 %d/%d · 상장 %d건", i, len(mapping), len(rows))
+        time.sleep(COMPANY_DELAY_S)
+
+    log.info("현재 상장 %d건 · 제외 %d건", len(rows), skipped)
     return rows
 
 
@@ -308,17 +319,23 @@ async def upsert(rows: Sequence[InstrumentRow]) -> int:
 
 
 # ── 진입점 ───────────────────────────────────────────────
-async def run(date: str | None = None) -> int:
-    """수집 → 고유번호 → upsert. 적재한 종목 수를 돌려준다."""
-    target = date or stock.get_nearest_business_day_in_a_week()
-    log.info("기준일 %s 로 종목 마스터를 적재한다.", target)
+async def run() -> int:
+    """corpCode → 기업개황 → upsert. 적재한 종목 수를 돌려준다."""
+    with httpx.Client() as client:
+        mapping = load_corp_codes(client)
+        if not mapping:
+            log.error(
+                "corpCode 매핑이 비었다. DART_API_KEY 없이는 종목 목록을 얻을 수 없다."
+            )
+            return 0
+        log.info("corpCode 상장 후보 %d건 — 기업개황으로 시장·업종을 채운다", len(mapping))
+        rows = collect_instruments(client, settings.dart_api_key, mapping)
 
-    rows = collect_instruments(target)
     if not rows:
-        log.error("수집된 종목이 없다. 기준일(%s)과 KRX 응답을 확인할 것.", target)
+        log.error("현재 상장 종목이 하나도 없다. DART 응답을 확인할 것.")
         return 0
 
-    attach_corp_codes(rows, load_corp_codes())
+    attach_corp_codes(rows, mapping)
     count = await upsert(rows)
     log.info("종목 마스터 %d건 적재 완료", count)
     return count
@@ -326,7 +343,6 @@ async def run(date: str | None = None) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="종목 마스터 적재기")
-    parser.add_argument("--date", help="기준일 YYYYMMDD. 생략하면 최근 영업일")
     parser.add_argument("--verbose", action="store_true", help="DEBUG 로그")
     args = parser.parse_args(argv)
 
@@ -334,7 +350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
     )
-    return 0 if asyncio.run(run(args.date)) else 1
+    return 0 if asyncio.run(run()) else 1
 
 
 if __name__ == "__main__":
