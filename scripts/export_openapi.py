@@ -48,7 +48,15 @@ def build() -> dict[str, Any]:
     app 임포트는 여기 안에서 한다. 모듈 스코프에서 하면 이 파일을 임포트하는
     것만으로 DB 엔진이 딸려 온다. 이 스크립트는 Postgres 없이 돌아야 한다.
     """
-    from app.api.main import app
+    try:
+        from app.api.main import app
+    except ModuleNotFoundError as exc:  # pragma: no cover - 실행 방식 안내
+        if exc.name != "app":
+            raise
+        raise SystemExit(
+            "저장소 루트에서 모듈로 실행해야 한다: python -m scripts.export_openapi\n"
+            "직접 경로로 부르면 sys.path에 루트가 없어 app 패키지를 찾지 못한다."
+        ) from exc
 
     schema = app.openapi()
     schema["servers"] = SERVERS
