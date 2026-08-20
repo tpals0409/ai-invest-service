@@ -3,6 +3,14 @@
 Korean stock market only. Virtual portfolio, no real brokerage.
 FastAPI + Postgres/pgvector. Engines compute; the LLM only explains.
 
+## Shared agent contract
+
+Read and follow `AGENTS.md` first. It is the model-independent operating
+contract shared by Claude and Codex. Orca, Git, and repository files are the
+durable sources of truth; never rely on this Claude session's memory for a
+handoff. Project workers must be visible in Orca worktrees and terminals, not
+hidden subagents.
+
 ## How to work here
 
 **Commit each logical unit.** Never hold more than one unfinished unit
@@ -21,12 +29,14 @@ live in `app/core/schemas.py`.
 
 **Read narrowly.** Design docs are in `docs/*.md` — never open the `.html`
 twins, they are half CSS. Read the section you were pointed at, once. For
-anything broader than a single file, delegate to an Explore subagent so the
-file dumps land in its context, not yours.
+anything broader than a single file, use a separately scoped Orca-visible
+worker when parallel exploration is actually useful.
 
 **Keep a progress note.** Append one line to `.worker/progress.md` after every
 commit and every decision you would not want to make twice — what is done,
-what is next, which paths matter. Two sentences, not a report.
+what is next, which paths matter. Two sentences, not a report. `.worker/` is
+ignored scratch, so also put durable handoff facts in the Orca worktree comment,
+worker prompt, or a commit.
 
 **After a compaction, read that note first.** Then `git log` and `git status`.
 Re-read a source file only if the note and the diff cannot answer your
