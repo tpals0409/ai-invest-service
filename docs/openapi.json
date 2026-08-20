@@ -571,6 +571,7 @@
   "paths": {
     "/api/ai/v1/briefing": {
       "get": {
+        "description": "오늘 알릴 항목 최대 4건을 골라 각각 두 문장으로 설명한다(§8).\n\n`empty`는 에러가 아니다. 원장을 못 읽거나 보유 종목이 없거나 알릴 만한 일이\n없으면 200에 `status: \"empty\"`로 답한다 — 화면은 이 값을 보고 섹션을 숨긴다.\n409는 항목을 골라 놓고도 문장을 만들 수 없을 때(LLM 키 부재)뿐이다.\n\n`generating`은 돌려주지 않는다. 배치가 없어서 요청 시점에 다 계산하기 때문에\n\"생성 중\"인 상태 자체가 존재하지 않는다.",
         "operationId": "get_briefing_api_ai_v1_briefing_get",
         "parameters": [
           {
