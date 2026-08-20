@@ -24,8 +24,13 @@ from app.engines.portfolio import DailyReturn, PortfolioSnapshot
 #: §8 — 브리핑은 최대 4건이다.
 MAX_ITEMS = 4
 
-#: 등락이 이보다 작으면 항목으로 만들지 않는다. 하루 ±0.5%는 할 말이 없는 움직임이다.
-MOVE_THRESHOLD = 0.005
+#: 등락이 이보다 작으면 항목으로 만들지 않는다.
+#: 0.5%로 두면 -0.52% 같은 움직임이 네 칸을 다 채워, 브리핑이 "비중만큼 반영됩니다"
+#: 수준의 동어반복으로 메워진다. 국내 대형주 일간 변동성이 대략 1.5~2%이므로 1σ를
+#: 문턱으로 잡아 그 아래는 아예 후보로 세우지 않는다 — 알릴 것이 없으면 §8의
+#: `empty`가 정답이지, 소음 네 건이 정답이 아니다.
+#: ponytail: 시장 변동성이 달라지면 조정할 값이다. 산식이 아니라 눈금이다.
+MOVE_THRESHOLD = 0.015
 
 #: 이 등락이면 importance가 1.0으로 포화한다.
 #: ponytail: §5.2 표는 이벤트만 다루고 등락은 다루지 않는다. 등락의 중요도는 크기로
@@ -169,13 +174,16 @@ def holding_moves(
     snapshot: PortfolioSnapshot,
     row: DailyReturn | None,
     *,
-    threshold: float = MOVE_THRESHOLD,
+    threshold: float | None = None,
 ) -> list[Candidate]:
     """보유 종목의 당일 등락(§8 `holding_move`). 이벤트가 없어도 나온다.
 
     등락은 `daily_returns()` 행에서, ŵ_i는 스냅샷에서 온다. 행의 `weight`는 전일
     총자산 대비라 랭킹의 ŵ와 다르다 — 섞으면 현금 비중만큼 순위가 흔들린다.
     """
+    # 기본값을 인자 자리에 박아 두면 def 시점에 굳어 눈금을 바꿀 수 없다. 테스트가
+    # 상수를 갈아 끼울 수 있도록 여기서 푼다.
+    threshold = MOVE_THRESHOLD if threshold is None else threshold
     if row is None:
         return []
     returns = {c.symbol: c.return_rate for c in row.contributions}

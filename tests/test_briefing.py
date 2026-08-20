@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from app.api.main import create_app
 from app.core.db import get_session
 from app.core.enums import BriefingCategory, EventType, RateSensitivity
+from app.engines import briefing as briefing_engine
 from app.engines.attribution import EventRecord
 from app.engines.briefing import (
     MAX_ITEMS,
@@ -185,11 +186,12 @@ def _row(*pairs: tuple[str, float], day: date = DAY) -> DailyReturn:
 def test_비중은_제곱근으로_들어가_최대_보유_종목이_전부_가져가지_못한다() -> None:
     """선형 가중이면 20% 종목이 네 칸을 다 먹는다. 그것을 막으려고 √를 쓴다."""
     snapshot = _snapshot(
-        _holding("BIG", weight=0.60, stock_weight=0.60),
-        _holding("SMALL", weight=0.05, stock_weight=0.05),
+        _holding("BIG", weight=0.36, stock_weight=0.36),
+        _holding("SMALL", weight=0.09, stock_weight=0.09),
     )
-    # 큰 종목은 겨우 0.6%, 작은 종목은 4% 움직였다.
-    top = rank(holding_moves(snapshot, _row(("BIG", 0.006), ("SMALL", 0.04))))
+    # 비중은 4배 차이지만 √를 거치면 2배로 줄고, 등락 격차가 그것을 뒤집는다.
+    # 두 값 모두 MOVE_THRESHOLD를 넘겨야 애초에 후보가 된다.
+    top = rank(holding_moves(snapshot, _row(("BIG", 0.016), ("SMALL", 0.05))))
 
     assert [item.candidate.related_tickers[0] for item in top] == ["SMALL", "BIG"]
 
@@ -399,6 +401,9 @@ def test_어제_나간_항목은_novelty에_눌려_1위를_내준다(monkeypatch
 
     같은 종목이 이틀 연속 1위를 차지해 브리핑이 어제와 똑같아지는 것을 막는 장치다.
     """
+    # 시드 원장의 마지막 거래일 등락은 하이닉스(+1.57%) 하나만 기본 임계를 넘는다.
+    # 이 테스트가 보는 것은 눈금이 아니라 순위·카테고리 배선이므로 눈금을 낮춰 고정한다.
+    monkeypatch.setattr(briefing_engine, "MOVE_THRESHOLD", 0.002)
     with _make_client(monkeypatch, StubSession()) as client:
         before = _get(client, HOLDER).json()["content"]["items"]
     first = before[0]
@@ -427,7 +432,12 @@ def test_원장_시작_이전을_요청하면_status_empty다(client: TestClient
     assert content["items"] == []
 
 
-def test_업종이_하나뿐이면_구조_변화_없이_등락만_나온다(client: TestClient) -> None:
+def test_업종이_하나뿐이면_구조_변화_없이_등락만_나온다(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 시드의 단일 보유 종목은 -0.53%라 기본 임계에 못 미친다. 여기서 보려는 것은
+    # "업종이 하나면 portfolio_shift가 없다"이지 눈금이 아니므로 낮춰 고정한다.
+    monkeypatch.setattr(briefing_engine, "MOVE_THRESHOLD", 0.002)
     content = _get(client, LONELY).json()["content"]
 
     assert content["status"] == "ready"
